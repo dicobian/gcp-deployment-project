@@ -1,127 +1,344 @@
 # Scalable Laravel Deployment on GCP (Terraform)
 
-Deploy aplikasi Laravel di Google Cloud dengan arsitektur multi-region:
-load balancer global, instance group dengan autoscaling di Jakarta dan
-Singapura, Cloud SQL private IP, dan semua infrastruktur ditulis sebagai
-kode dengan Terraform.
+Aplikasi Laravel (Filament) yang biasanya dijalankan di satu server, di sini dijalankan di banyak VM sekaligus pada dua region Google Cloud (Jakarta dan Singapura). Trafik dibagi oleh load balancer global, jumlah VM menyesuaikan beban lewat autoscaling, health check memantau kondisi setiap VM, dan seluruh infrastrukturnya ditulis sebagai kode dengan Terraform.
 
-Aplikasi laravel filament yang biasanya dideploy di server tunggal, disini dideploy di banyak instance sekaligus, infrastruktur dibentuk agar bisa scaling secara automatis dengan bantuan  load balancer, instance group sebagai backend dengan dilengkapi auto scaller, dan healthcheck untuk melakukan inspeksi  kondisi tiap instance.
+**Stack:** GCP · Terraform · Laravel (Filament) · PostgreSQL · Apache
 
-**Stack:** GCP, Terraform, Apache, PostgreSQL, Laravel
+**Status:** proyek belajar dan portofolio, bukan konfigurasi produksi.
 
-**Status:** Projek Belajar dan Portofolio
+![Diagram arsitektur](docs/architecture-diagram.png)
 
-![Architecture](docs/architecture-diagram.png)
+## Daftar isi
+
+- [Apa yang dibangun](#apa-yang-dibangun)
+- [Alur trafik](#alur-trafik)
+- [Spesifikasi utama](#spesifikasi-utama)
+- [Layanan yang dipakai](#layanan-yang-dipakai)
+- [Keamanan](#keamanan)
+- [Cara menjalankan](#cara-menjalankan)
+- [Pengujian](#pengujian)
+- [Keputusan desain](#keputusan-desain)
+- [Keterbatasan dan rencana perbaikan](#keterbatasan-dan-rencana-perbaikan)
+- [Masalah yang dihadapi dan solusinya](#masalah-yang-dihadapi-dan-solusinya)
+- [Estimasi biaya](#estimasi-biaya)
+- [Struktur repositori](#struktur-repositori)
 
 ## Apa yang dibangun
-- Global HTTP load balancer ke dua region (asia-southeast2 dan asia-southeast1)
-- Managed instance group dengan autoscaling (CPU 60%) dan auto-healing
+
+- Global HTTP load balancer yang melayani dua region (`asia-southeast2` Jakarta dan `asia-southeast1` Singapura)
+- Managed instance group di setiap region dengan autoscaling (CPU 60%, minimum 1 dan maksimum 3 VM) dan auto-healing
 - Cloud SQL PostgreSQL dengan private IP (tanpa IP publik)
-- VM tanpa IP publik, akses keluar lewat Cloud NAT, SSH lewat IAP
-- Password database di Secret Manager, VM tanpa file key
-- Terraform: seluruh stack bisa dibangun dan dihancurkan dengan satu perintah
+- VM tanpa IP publik: akses keluar lewat Cloud NAT, akses SSH lewat IAP
+- Password database disimpan di Secret Manager, VM tidak memakai file key
+- Sesi pengguna disimpan di database, sehingga login tetap berlaku walau berpindah antar VM atau antar region
+- Seluruh infrastruktur ditulis dengan Terraform dan bisa dibangun serta dihapus dengan `terraform apply` dan `terraform destroy`. Pengecualiannya adalah disk model untuk image, yang disiapkan manual (lihat [Cara menjalankan](#cara-menjalankan))
 
 ## Alur trafik
 
-**inbound:** trafic dari user masuk melalui ip public load balancer sebagai single entry point, traffic akan diarahkan ke backend terdekat dengan bantuan load balancer, di dalam load balancer trafic akan diproses, dan diteruskan ke instance yang tepat berdasarkan protocol, port dan url prefix ke instance yang tepat
+**Masuk (inbound).** Pengguna mengakses IP publik load balancer, satu-satunya pintu masuk ke sistem. Load balancer meneruskan trafik ke backend sehat yang paling dekat dengan pengguna, lalu ke salah satu VM di instance group backend tersebut. Kesehatan setiap VM ditentukan oleh health check pada path `/up`.
 
-**outbound:** vm instance tidak memiliki ip public sehingga outbound trafic akan ditangani oleh cloud NAT 
+**Keluar (outbound).** VM tidak memiliki IP publik, sehingga trafik keluar ke internet (misalnya mengunduh paket) melewati Cloud NAT. Setiap region memiliki Cloud Router dan Cloud NAT sendiri.
 
-**akses database:** di dalam setiap instance terdapat cloud sql proxy, cloud sql proxy akan membentuk koneksi ke cloud sql instance melalui private ip, dan disini method yang digunakan adalah PSA (private service access), cloud sql proxy akan mengenkripsi setiap transaksi database yang menuju sql instance, aplikasi tidak menghubungi database secara langsung melainkan melalui cloud sql proxy pada ip 127.0.0.1, jadi seakan akan database nya berada di instance yang sama dengna aplikasi 
+**Akses database.** Di setiap VM berjalan Cloud SQL Proxy. Aplikasi tidak menghubungi database secara langsung, melainkan menyambung ke `127.0.0.1:5432`, seolah-olah database berada di VM yang sama. Proxy kemudian membentuk koneksi terenkripsi ke instance Cloud SQL lewat private IP memakai Private Service Access (PSA). Database berada di Jakarta, sehingga VM di Singapura mengaksesnya lintas region.
 
-**storage:** vm instance mengakses cloud storage dan secret manager( tempat password ) melalui private google access
+**Penyimpanan dan rahasia.** VM mengakses Cloud Storage (file unggahan) dan Secret Manager (password database) lewat Private Google Access, tanpa melewati internet publik. Saat boot, startup script mengambil password dari Secret Manager dan menuliskannya ke file `.env`.
+
+## Spesifikasi utama
+
+| Komponen | Konfigurasi |
+| :--- | :--- |
+| VPC | `my-network` (custom), subnet `subnet-indonesia` 10.10.1.0/24 dan `subnet-singapura` 10.10.2.0/24, Private Google Access aktif |
+| VM | `e2-small`, Spot, disk 10 GB, tanpa IP publik |
+| Autoscaling | Minimum 1, maksimum 3 VM per region, target CPU 60% |
+| Health check | HTTP port 80, path `/up`, interval 10 detik, timeout 5 detik, sehat setelah 2 kali berhasil, tidak sehat setelah 3 kali gagal |
+| Load balancer | Global external Application Load Balancer, HTTP port 80 |
+| Database | Cloud SQL PostgreSQL 18, `db-f1-micro`, satu zona, SSD 10 GB, private IP saja |
+| Bucket | Cloud Storage regional Jakarta, kelas Standard, akses publik dicegah |
 
 ## Layanan yang dipakai
+
 | Layanan | Fungsi | Alasan dipilih |
 | :--- | :--- | :--- |
-| VPC Network custom |Membangun virtual Lan | butuh kendali penuh terhadap jaringan infrastruktur |
-| Cloud NAT | sebagai pintu outbound ke internet | instance tidak memiliki ip public, oleh karena itu butuh NAT untuk melakukan outbound trafic ke luar |
-| Cloud Firewall | mengatur perizinan lalu lintas trafic | memperkuat keamanan dengan hanya membuka port yang dibutuhkan saja, menerapkan least privilage |
-| Cloud Storage | menyimpan data berbentuk object | aplikasi membutuhkan penyimpanan file |
-| Cloud SQL | menyiimpan database | aplikasi membutuhkan operasi database, instance dibutuhkan untuk mengelola database |
-| Secret Manager | menyimpan password | menerapkan keamanan password dengan tidak menyimpan password langsung di instance |
-| Instance Template | untuk membuat blueprint instance | instance group butuh instance template sebagai acuan spesifikasi instance yang akan dibentuk ketika scale up dan down |
-| Instance Group | berperan sebagai instance manager | untuk melakukan scaling secara automatis dibutuhkan instance group sebagai pengelola nya |
-| IAM & Admin | mengontrol permission ke setiap resource | menerapkan least privilage dengan memberikan permission yang dibutuhkan saja, mempersempit skala permission |
-| Load Balancer | mengelola trafik | load balancer dibutuhkan untuk mengatur trafik, mengarahkan trafik pengguna ke instance yang terdekat, membagi trafik secara automatis ke banyak instance |
-| Health Check | sebagai indikator untuk load balancer dan instance group | membantu instance group untuk mengetahui kapan harus melakukan scaling dan membantu load balancer untuk memilih instance  yang sehat |
-
-
+| VPC Network (custom) | Jaringan virtual privat | Kendali penuh atas rentang IP, subnet, dan aturan jaringan |
+| Cloud Firewall | Mengatur lalu lintas yang diizinkan | Hanya membuka port yang dibutuhkan (prinsip least privilege) |
+| Cloud NAT dan Cloud Router | Jalur keluar ke internet | VM tanpa IP publik tetap bisa mengunduh paket |
+| Cloud Storage | Menyimpan file unggahan | Semua VM berbagi satu penyimpanan, tidak ada file yang tertinggal di disk VM |
+| Cloud SQL | Database PostgreSQL terkelola | Backup, patching, dan operasional database dikelola Google |
+| Secret Manager | Menyimpan password database | Tidak ada password di image maupun repositori |
+| Instance Template | Cetak biru VM (image, tipe mesin, jaringan, service account) | Instance group membutuhkannya untuk membuat VM baru saat scale up atau menggantikan VM yang rusak |
+| Managed Instance Group | Mengelola sekumpulan VM | Menjaga jumlah VM, menjalankan rolling update, dan melakukan auto-healing |
+| Autoscaler | Mengatur jumlah VM sesuai beban | Menambah VM saat CPU tinggi dan menguranginya saat beban turun |
+| Health Check | Memeriksa apakah VM sehat | Load balancer berhenti mengirim trafik ke VM yang tidak sehat, dan instance group membuat ulang VM tersebut (auto-healing) |
+| Load Balancer | Pintu masuk dan pembagi trafik | Satu IP untuk dua region, mengarahkan pengguna ke backend sehat terdekat |
+| IAM | Mengatur izin tiap resource | Setiap izin dibatasi sesempit mungkin |
 
 ## Keamanan
-- Service account khusus dengan role sempit (daftar role)
-- Token Creator hanya untuk akun itu sendiri (signed URL)
-- Firewall hanya mengizinkan health check dan IAP
-- Rahasia di Secret Manager, tidak di image atau repo
-- Transaksi database dienkripsi melalui cloud sql proxy, dan aplikasi tidak mengakases database secara langsung melainkan dijembatani oleh cloud sql proxy
-- Instance vm tidak memiliki ip public, trafic outbound melalui cloud NAT
+
+- Service account khusus untuk VM (`laravel-vm-account`), tanpa role Editor
+- VM tidak memiliki IP publik, dan trafik keluar melewati Cloud NAT
+- Cloud SQL hanya memiliki private IP, tanpa IP publik
+- Koneksi ke database dienkripsi oleh Cloud SQL Proxy
+- Password database disimpan di Secret Manager, tidak ada di image maupun repositori
+- VM tidak memakai file key: autentikasi lewat service account yang terpasang pada VM
+- Bucket bersifat privat (`public_access_prevention = enforced`)
+- SSH hanya lewat Identity-Aware Proxy (IAP)
+
+**Izin IAM service account VM**
+
+| Role | Dipasang di | Kegunaan |
+| :--- | :--- | :--- |
+| Cloud SQL Client | project | Menyambung ke instance Cloud SQL lewat proxy |
+| Storage Object Admin | bucket aplikasi saja | Membaca, menulis, dan menghapus file di bucket |
+| Secret Manager Secret Accessor | secret password database saja | Membaca password saat boot |
+| Service Account Token Creator | service account itu sendiri | Membuat signed URL Cloud Storage tanpa file key |
+
+VM memakai access scope `cloud-platform`, sehingga batas akses sebenarnya ditentukan oleh role IAM di atas.
+
+**Aturan firewall**
+
+| Tujuan | Sumber | Port | Target |
+| :--- | :--- | :--- | :--- |
+| Health check dan trafik load balancer | `130.211.0.0/22`, `35.191.0.0/16` | tcp:80 | tag `allow-health-check-laravel` |
+| SSH lewat IAP | `35.235.240.0/20` | tcp:22 | tag `allow-ssh-iap` |
 
 ## Cara menjalankan
-1. disk boot yang akan dipakai untuk membentuk image harus dibuat dulu.
-2. bisa ambil dari disk yang sudah tersedia, atau buat terlebih dahulu dengan membuat 1 instance dan konfigurasikan aplikasi laravel sampai jalan, lalu disknya dipakai untuk membuat image
-3. sesuaikan nama disknya di file compute-instance.tf di bagian `source_disk = "projects/belajar-project-terraform/zones/asia-southeast2-b/disks/laravel-model3"`
-4. setelah itu jalankan `terraform init` sebagai inisiasi awal. 
-5. jalankan `terraform plan`, untuk melihat perubahan apa saja yang akan terjadi
-6. jalankan `terrform apply` lalu ketikan yes ketika muncul pilihan
 
+**Prasyarat**
 
-## Pengujian: uji failover dan auto-healing.
-<!-- Screenshot dan hasil: backend healthy, sesi tetap login antar region, -->
+- Terraform 1.6 atau lebih baru
+- Google Cloud CLI (`gcloud`)
+- Project GCP dengan billing aktif dan akun yang memiliki hak cukup (misalnya Owner di project belajar)
 
+**1. Siapkan disk model untuk image (manual)**
 
-masing masing backend dalam keadaan healthy
+Image VM dibuat dari sebuah disk yang sudah berisi aplikasi yang berjalan. Langkahnya:
 
-![Architecture](docs/load-balancer.png)
+1. Buat VM sementara dari image Debian (boleh di VPC `default` dengan IP publik sementara, karena yang dipakai nanti hanya disknya).
+2. Pasang Apache, PHP, Composer, dan aplikasi Laravel, lalu pasang Cloud SQL Proxy versi 2 sebagai service systemd.
+3. Pastikan aplikasi berjalan sendiri saat boot dan `http://localhost/up` mengembalikan respons sukses.
+4. Kosongkan nilai rahasia di `.env`, supaya image tidak membawa password.
+5. Hentikan VM. Disknya tetap ada dan siap dijadikan image.
 
-### simulasi failover
+Startup script pada instance template mengisi `DB_USERNAME`, `DB_PASSWORD`, `GOOGLE_CLOUD_PROJECT_ID`, dan `GOOGLE_CLOUD_STORAGE_BUCKET` di `.env`, memperbarui connection name pada service proxy, lalu me-restart layanan. Jalur aplikasi dan nama service di dalam image harus sesuai dengan yang dipakai skrip tersebut.
 
-awalnya backend terdekat dari saya adalah backend instance group Indonesia, lalu saya uji simulasi failover dengan mematikan web server di instance milik instance group laravel indonesia dan mengubah minimum instance nya menjadi 0 untuk mencegah instance group melakukan self healing. 
+**2. Siapkan akses dan variabel**
 
-![Architecture](docs/failover2.png)
-<!-- <img src="docs/failover2.png" alt="Deskripsi gambar" width="400"> -->
+```bash
+gcloud auth application-default login
+```
 
-health check mendeteksi adanya kegagalan pada instance di instance group indonesia, sehingga load balancer akan mengalihkan ke instance yang berada di singapura 
+Buat file `terraform.tfvars` (file ini tidak di-commit):
 
-![Architecture](docs/failover3.png)
+```hcl
+project_id = "ID-PROJECT-GCP-KAMU"
+```
 
-hasilnya web masih bisa diakses dan sesion login user di region sebelumnya tidak terhapus karena session dipindah ke database bukan di instance vm
+Variabel lain dapat dilihat di `variables.tf`.
 
-![Architecture](docs/failover4.png)
+**3. Sesuaikan nama disk**
 
-### simulasi self healing
+Ubah `source_disk` pada resource image di file `compute-instance.tf` sesuai disk model milikmu:
 
-kemudian minimum instance nya saya ubah ke 1, artinya harus selalu ada 1 instance yang aktif dan sehat.
+```hcl
+source_disk = "projects/PROJECT_ID/zones/asia-southeast2-b/disks/NAMA_DISK_MODEL"
+```
 
-![Architecture](docs/failover5.png)
+**4. Jalankan Terraform**
 
-instance group akan melakukan self healing memulihkan instance nya sendiri secara automatis terhlihat disini healthcheck menunjukan instance dalam keaadaan sehat kembali
+```bash
+terraform init      # mengunduh provider
+terraform plan      # melihat apa yang akan dibuat
+terraform apply     # ketik yes saat diminta
+```
 
-![Architecture](docs/failover6.png)
+Beberapa catatan:
 
+- Pembuatan Cloud SQL paling lama dan bisa memakan lebih dari 10 menit.
+- Jika `apply` pertama gagal karena API baru diaktifkan, tunggu satu atau dua menit lalu jalankan `apply` lagi. Perintah ini aman diulang.
+- Load balancer membutuhkan beberapa menit sampai siap. Selama itu respons `404` atau `502` masih normal.
 
+**5. Jalankan migrasi database**
+
+Database yang baru dibuat masih kosong. Setelah ada VM yang sehat, jalankan migrasi dari salah satu VM:
+
+```bash
+gcloud compute instances list --filter="name~laravel"
+gcloud compute ssh NAMA_VM --zone=ZONA --tunnel-through-iap
+
+cd /var/www/school-app
+php artisan migrate --force
+```
+
+Jalankan juga seeder atau pembuatan akun admin awal jika diperlukan.
+
+**6. Akses aplikasi**
+
+```bash
+terraform output -raw lb_ip
+```
+
+Buka `http://<IP-tersebut>` di browser.
+
+**7. Hapus semua resource**
+
+```bash
+terraform destroy
+```
+
+> **Perhatian biaya:** load balancer, Cloud NAT, Cloud SQL, dan VM berbayar selama masih berjalan. Jalankan `terraform destroy` setelah selesai mencoba.
+>
+> Nama instance Cloud SQL yang sudah dihapus tidak bisa dipakai lagi dalam beberapa hari. Jika ingin membangun ulang, ubah namanya. Jika `destroy` gagal di koneksi private services, tunggu beberapa menit lalu jalankan lagi.
+
+## Pengujian
+
+Semua pengujian dilakukan lewat IP load balancer.
+
+### Semua backend sehat
+
+Kedua backend (Jakarta dan Singapura) berstatus healthy pada load balancer.
+
+![Backend load balancer berstatus healthy](docs/load-balancer.png)
+
+### Simulasi failover
+
+Backend terdekat dari lokasi penguji adalah instance group Jakarta. Untuk menguji failover, web server (Apache) pada VM di instance group Jakarta dimatikan, dan jumlah minimum instance diturunkan menjadi 0 supaya grup tidak segera membuat ulang VM selama pengujian.
+
+![Kondisi awal pengujian failover](docs/failover2.png)
+
+Health check mendeteksi kegagalan pada instance group Jakarta, sehingga load balancer mengalihkan trafik ke instance group Singapura.
+
+![Load balancer mengalihkan trafik ke Singapura](docs/failover3.png)
+
+Hasilnya, aplikasi tetap bisa diakses. Sesi login pengguna juga tetap berlaku karena sesi disimpan di database, bukan di disk VM.
+
+![Aplikasi tetap dapat diakses dan sesi login tidak hilang](docs/failover4.png)
+
+### Pemulihan kapasitas oleh autoscaler
+
+Jumlah minimum instance dikembalikan menjadi 1. Autoscaler membuat VM baru di instance group Jakarta sampai jumlah minimumnya terpenuhi.
+
+![Minimum instance dikembalikan menjadi 1](docs/failover5.png)
+
+Setelah VM baru selesai boot, health check menunjukkan instance kembali sehat dan backend Jakarta aktif lagi.
+
+![Instance baru berstatus sehat](docs/failover6.png)
+
+<!--
+Opsional, uji auto-healing (belum dijalankan):
+Dengan minimum instance 1 atau lebih, matikan Apache pada satu VM
+(sudo systemctl stop apache2). Health check akan menandai VM tidak sehat,
+lalu instance group menghapusnya dan membuat VM pengganti.
+Tambahkan screenshot dan hasilnya di sini setelah diuji.
+-->
 
 ## Keputusan desain
-Kenapa dua region, kenapa VPC custom, kenapa satu template per region,
-kenapa private IP + PSA.
 
-- penggunaan dua region berbeda mensimulasikan ketersediaan bagi pengguna di region yang berbeda sehingga pengguna di masing masing region akan diarahkan ke instance server terdekat sehingga latensi nya kecil, selain itu jika terjadi kerusakan misalnya akibat bencana di salah satu region, layanan aplikasi masih bisa berjalan
-- penggunaan vpc custom karena vpc custom hanya membuka port atau jalur yang kita buka saja, pada awalnya semua jalur di vpc custom ditutup semua. vpc default dari gcp menyediakan jalur port yang lebih longgar. 
-- penggunaan satu template per region dikarenakan penggunaan vpc custom dengan vpc subnet yang terikat dimasing masing region, sehingga instance template harus menggunakan subnet yang sesuai dengan region nya, berbeda hal nya ketika menggunakan vpc default yang mana subnetnya automatis sehingga location nya bisa di set global dan instance template cukup satu untuk semua region
-- penggunaan ip private dengan koneksi private psa pada cloud sql instance untuk meningkatkan keamanaan, mempersempit jalur akses ke instance database dan menyediakan koneksi yang terenkripsi melalui jalur private
+| Keputusan | Alasan | Konsekuensi |
+| :--- | :--- | :--- |
+| Dua region | Pengguna dilayani backend terdekat sehingga latensi kecil, dan jika satu region bermasalah (misalnya bencana), aplikasi tetap berjalan di region lain | Database hanya di Jakarta, sehingga VM di Singapura mengakses database lintas region |
+| VPC custom, bukan `default` | VPC custom dimulai dari kondisi tertutup dan hanya membuka jalur yang diizinkan, sedangkan VPC `default` menyediakan aturan firewall yang lebih longgar | Subnet bersifat regional dan semua resource jaringan harus ditulis sendiri |
+| Satu instance template per region | Di VPC custom setiap subnet terikat pada satu region, dan template harus menunjuk subnet yang sesuai. Di VPC `default` subnet dibuat otomatis, sehingga satu template global cukup untuk semua region | Template dan instance group ditulis dua kali (satu per region) |
+| Cloud SQL dengan private IP dan PSA | Database tidak terbuka ke internet dan koneksinya lewat jalur privat | Perlu rentang IP khusus dan koneksi peering ke jaringan layanan Google |
+| Sesi disimpan di database | Pengguna tidak kehilangan sesi saat berpindah VM atau region | Menambah beban pada database |
+| VM Spot | Biaya jauh lebih rendah untuk proyek belajar | VM bisa dihentikan Google sewaktu-waktu |
+| Secret Manager untuk password | Password tidak tertanam di image atau repositori, dan mudah diganti | VM membutuhkan izin Secret Accessor dan jalur ke API Google |
 
 ## Keterbatasan dan rencana perbaikan
 
-- saat ini load balancer hanya menangani trafik protokol http saja, untuk menyediakan enkripsi ssl diperlukan domain name. perbaikan kedepan adalah menambah satu frontend yang menangani trafik https 
-- saat ini pembuatan image masih mengandalkan disk yang harus dibuat dulu, sehingga user perlu membuat 1 instance lalu mengkonfigurasikannya sampai aplikasi nya berjalan lalu disk bootnya dijadikan image, kedepannya instance yang dijadikan untuk membuat disk boot akan dibuat melalui terraform juga. 
-
+- **Hanya HTTP.** Load balancer baru menangani protokol HTTP karena belum ada nama domain. Rencana: mendaftarkan domain, memakai sertifikat terkelola, dan menambah frontend HTTPS.
+- **Pembuatan image masih manual.** Disk model harus disiapkan dan dikonfigurasi dulu. Rencana: mengotomatiskan pembuatan image (misalnya dengan Packer) atau pipeline CI/CD.
+- **VM Spot.** VM bisa dihentikan sewaktu-waktu sehingga aplikasi bisa terputus sebentar. Untuk produksi dipakai VM standar.
+- **Database satu zona, tanpa HA dan backup.** Cloud SQL berjalan di satu zona dengan backup dimatikan. Rencana: konfigurasi HA dan backup otomatis.
+- **Database hanya di Jakarta.** VM Singapura mengakses database lintas region. Rencana: read replica di Singapura.
+- **Password ada di state Terraform.** Password dibuat oleh `random_password`, sehingga tersimpan di file state. Rencana: memindahkan state ke bucket GCS dengan akses terbatas.
+- **Belum ada monitoring, alert, dan CI/CD.** Rencana: dashboard dan alert di Cloud Monitoring, serta pipeline untuk pengujian dan deploy otomatis.
 
 ## Masalah yang dihadapi dan solusinya
-- masalah ketika health check selalu gagal di awal pembentukan instance, dan ditemukan masalahnya path health check salah didefinisikan, ternyata laravel menyediakan url khusus healthcheck yang secara default diatur ke url /up, dan saya set path health checknya seperti ini "/"
-- masalah aplikasi selalu gagal mengakses storage bucket, dan masalahnya adalah instance vm tidak mempunya akses untuk membuat token untuk dirinya sendiri, akses storage tanpa key membutuhkan semacam token autentikasi sementara. 
-- masalah ketika pertamakali melalkukan konfigurasi cloud sql proxy, yang selalu gagal terhubung ke cloud sql instance, dan masalahnya adalah cloud sql proxy versi pertama sudah deprecated dan harus menggunakan versi 2
-- masalah ketika instance vm tertolak untuk mengakses resource lain nya seperti google storage dan cloud sql, masalahnya adalah scope untuk mengakses resource lain belum ditambahkan, lalu untuk menyelesaikan nya scope diatur ke all scope, akan instance punya akses untuk mengakses semua resource
-- maslaah ketika instance vm tidak diizinkan mengakses google storage, dan masalahnya adalah service account yang gigunakan tidak memiliki role read dan write, permission harus diatur di kedua pihak, di storage dengan menbambahkan principal dengan role yang tepat, begitu juga di sisi service account diberi role untuk mengakses cloud storage
--
+
+**1. Health check selalu gagal saat VM baru dibuat**
+- *Gejala:* VM terus ditandai tidak sehat.
+- *Penyebab:* path health check diatur ke `/`, padahal Laravel menyediakan endpoint khusus `/up`.
+- *Solusi:* path health check diubah menjadi `/up`.
+
+**2. Cloud SQL Proxy tidak bisa terhubung ke database**
+- *Gejala:* proxy gagal terhubung dan koneksi dari aplikasi terputus.
+- *Penyebab:* proxy versi pertama sudah deprecated sehingga harus memakai versi 2. Selain itu, setelah file service systemd diubah, `systemctl daemon-reload` belum dijalankan, sehingga proxy masih memakai connection name lama.
+- *Solusi:* memakai Cloud SQL Proxy versi 2, lalu menjalankan `daemon-reload` dan me-restart proxy.
+
+**3. Aplikasi tidak bisa mengakses Cloud Storage**
+- *Gejala:* operasi file di bucket gagal.
+- *Penyebab:* ada dua izin yang kurang. Pertama, service account belum memiliki role Storage di bucket. Kedua, pembuatan signed URL tanpa file key memerlukan izin Token Creator pada service account itu sendiri.
+- *Solusi:* role Storage Object Admin dipasang di bucket, dan role Service Account Token Creator dipasang pada service account VM untuk dirinya sendiri.
+
+**4. VM ditolak saat mengakses layanan Google lain**
+- *Gejala:* permintaan ke Cloud Storage dan Cloud SQL ditolak.
+- *Penyebab:* access scope VM belum mencakup API yang dibutuhkan.
+- *Solusi:* scope diatur ke `cloud-platform`, dan pembatasan akses dilakukan lewat role IAM.
+
+**5. Instance template selalu diganti pada setiap `terraform apply`**
+- *Gejala:* `terraform plan` selalu menampilkan penggantian template (`forces replacement`) padahal kode tidak berubah.
+- *Penyebab:* untuk VM Spot, GCP mengisi sendiri `instance_termination_action = "STOP"`, sedangkan nilai itu belum ditulis di kode, sehingga Terraform mendeteksi selisih.
+- *Solusi:* menuliskan `instance_termination_action = "STOP"` secara eksplisit di blok `scheduling`.
+
+**6. Cloud SQL private IP gagal dibuat**
+- *Gejala:* error "the network doesn't have at least 1 private services connection".
+- *Penyebab:* VPC belum memiliki koneksi private services, yang di console sering dibuat otomatis tetapi di Terraform harus ditulis sendiri.
+- *Solusi:* menambahkan rentang IP (`google_compute_global_address`) dan koneksi (`google_service_networking_connection`), lalu membuat Cloud SQL bergantung pada koneksi tersebut.
+
+**7. Secret Manager gagal dibuat**
+- *Gejala:* error 403 `SERVICE_DISABLED`.
+- *Penyebab:* API Secret Manager belum diaktifkan di project.
+- *Solusi:* mengaktifkan API lewat Terraform (`google_project_service`) dan menambahkan `depends_on` pada resource yang membutuhkannya.
 
 ## Estimasi biaya
-masih kebingungan cara menghitung nya 
+
+Biaya dipengaruhi oleh lamanya resource dibiarkan berjalan. Komponen utamanya:
+
+| Komponen | Catatan |
+| :--- | :--- |
+| Load balancer global | Berbayar selama forwarding rule ada, ditambah biaya trafik |
+| Cloud NAT (dua gateway) | Berbayar per jam, ditambah biaya data yang diproses |
+| Cloud SQL `db-f1-micro` dan disk | Berbayar selama instance ada, walau tidak dipakai |
+| VM Spot `e2-small` dan disk | Berbayar saat VM berjalan. Autoscaler menjaga minimal 1 VM per region |
+| Trafik antar region | Dihitung per GB (VM Singapura ke database Jakarta) |
+| Cloud Storage dan Secret Manager | Sangat kecil untuk pemakaian proyek ini |
+
+**Cara menghitung perkiraan**
+
+1. Buka [Google Cloud Pricing Calculator](https://cloud.google.com/products/calculator).
+2. Tambahkan setiap komponen di atas dengan spesifikasi dari bagian [Spesifikasi utama](#spesifikasi-utama).
+3. Gunakan asumsi jumlah jam berjalan per bulan (satu bulan penuh kira-kira 730 jam).
+
+**Cara melihat biaya aktual**
+
+Buka **Billing → Reports** di console, pilih project dan rentang tanggal pengujian, lalu kelompokkan berdasarkan SKU.
+
+<!--
+TODO: isi angka dari halaman Billing setelah pengujian, misalnya:
+Biaya aktual selama pengujian: X untuk sekitar Y jam.
+-->
+
+**Mengendalikan biaya**
+
+- Jalankan `terraform destroy` setelah selesai mencoba.
+- Buat budget alert di **Billing → Budgets & alerts** supaya ada peringatan sebelum biaya membengkak.
+
+## Struktur repositori
+
+```
+.
+├── README.md
+├── providers.tf              # versi Terraform dan provider
+├── variables.tf              # variabel input
+├── apis.tf                   # pengaktifan API GCP
+├── network.tf                # VPC, subnet, firewall, router, NAT, PSA
+├── iam.tf                    # service account dan izin IAM
+├── storage.tf                # bucket
+├── database.tf               # Cloud SQL, database, user
+├── secrets.tf                # Secret Manager
+├── compute-instance.tf       # image, template, health check, instance group, autoscaler
+├── loadbalancer.tf           # load balancer
+├── outputs.tf                # output (IP load balancer, dan lainnya)
+├── .terraform.lock.hcl       # kunci versi provider
+└── docs/                     # diagram dan screenshot
+```
