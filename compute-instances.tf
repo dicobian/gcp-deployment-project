@@ -4,10 +4,11 @@
 #   name    = "laravel-image2"
 #   project = var.project_id2
 # }
+
 // IMAGE FOR INSTANCE TEMPLATE CREATED FROM INSTANCE DISK
 resource "google_compute_image" "laravel-image" {
   name        = "laravel-image"
-  source_disk = "projects/belajar-project-terraform/zones/asia-southeast2-b/disks/laravel-model3"
+  source_disk = "projects/belajar-project-terraform/zones/asia-southeast2-b/disks/laravel-model3" //perlu disesuaikan disk nya untuk membuat image
   lifecycle {
     prevent_destroy = false
   }
