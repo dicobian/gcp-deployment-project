@@ -312,4 +312,5 @@ kemudian kita check log nya, terlihat disini healthcheck mengalami kegagalan, la
 ├── outputs.tf                # output (IP load balancer, dan lainnya)
 ├── .terraform.lock.hcl       # kunci versi provider
 └── docs/                     # diagram dan screenshot
+└── script_secret_manager.sh  # script startup untuk menangani secret manager, sekaligus restart service
 ```
