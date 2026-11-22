@@ -223,13 +223,16 @@ Setelah VM baru selesai boot, health check menunjukkan instance kembali sehat da
 
 ![Instance baru berstatus sehat](docs/failover6.png)
 
-<!--
-Opsional, uji auto-healing (belum dijalankan):
-Dengan minimum instance 1 atau lebih, matikan Apache pada satu VM
-(sudo systemctl stop apache2). Health check akan menandai VM tidak sehat,
-lalu instance group menghapusnya dan membuat VM pengganti.
-Tambahkan screenshot dan hasilnya di sini setelah diuji.
--->
+### simulasi self healing 
+
+disini kita akan mencoba mematikan layanan apache pada instance di instance group singapura
+
+![mematikan layanan apache2](docs/failover8.png)
+
+kemudian kita check log nya, terlihat disini healthcheck mengalami kegagalan, lalu instance group mulai membuat instance baru dengan nama yang sama sebagai pengganti, dan menghapus instance lama
+
+![Instance baru berstatus sehat](docs/failover7.png)
+
 
 ## Keputusan desain
 
@@ -290,38 +293,6 @@ Tambahkan screenshot dan hasilnya di sini setelah diuji.
 - *Penyebab:* API Secret Manager belum diaktifkan di project.
 - *Solusi:* mengaktifkan API lewat Terraform (`google_project_service`) dan menambahkan `depends_on` pada resource yang membutuhkannya.
 
-## Estimasi biaya
-
-Biaya dipengaruhi oleh lamanya resource dibiarkan berjalan. Komponen utamanya:
-
-| Komponen | Catatan |
-| :--- | :--- |
-| Load balancer global | Berbayar selama forwarding rule ada, ditambah biaya trafik |
-| Cloud NAT (dua gateway) | Berbayar per jam, ditambah biaya data yang diproses |
-| Cloud SQL `db-f1-micro` dan disk | Berbayar selama instance ada, walau tidak dipakai |
-| VM Spot `e2-small` dan disk | Berbayar saat VM berjalan. Autoscaler menjaga minimal 1 VM per region |
-| Trafik antar region | Dihitung per GB (VM Singapura ke database Jakarta) |
-| Cloud Storage dan Secret Manager | Sangat kecil untuk pemakaian proyek ini |
-
-**Cara menghitung perkiraan**
-
-1. Buka [Google Cloud Pricing Calculator](https://cloud.google.com/products/calculator).
-2. Tambahkan setiap komponen di atas dengan spesifikasi dari bagian [Spesifikasi utama](#spesifikasi-utama).
-3. Gunakan asumsi jumlah jam berjalan per bulan (satu bulan penuh kira-kira 730 jam).
-
-**Cara melihat biaya aktual**
-
-Buka **Billing → Reports** di console, pilih project dan rentang tanggal pengujian, lalu kelompokkan berdasarkan SKU.
-
-<!--
-TODO: isi angka dari halaman Billing setelah pengujian, misalnya:
-Biaya aktual selama pengujian: X untuk sekitar Y jam.
--->
-
-**Mengendalikan biaya**
-
-- Jalankan `terraform destroy` setelah selesai mencoba.
-- Buat budget alert di **Billing → Budgets & alerts** supaya ada peringatan sebelum biaya membengkak.
 
 ## Struktur repositori
 
